@@ -210,11 +210,14 @@ def build_video(cards, out_mp4, ffmpeg):
 # ---------------------------------------------------------------- 폴더 하나 변환
 
 def decide_type(parsed, folder):
+    # 2026-10-06 대표 결정 「릴스 말고 사진(4:5)만」: 4:5 카드(1080x1350_NN.jpg)가 있으면 폴더 이름이 「릴스」여도 캐러셀로 올린다.
+    has_car = any(CAROUSEL_RE.match(p.name) for p in Path(folder).iterdir())
+    has_reel = any(REEL_RE.match(p.name) for p in Path(folder).iterdir())
+    if has_car:
+        return 'carousel'
     t = KIND_TO_TYPE.get(parsed['kind'])
     if t:
         return t
-    has_car = any(CAROUSEL_RE.match(p.name) for p in Path(folder).iterdir())
-    has_reel = any(REEL_RE.match(p.name) for p in Path(folder).iterdir())
     if has_car and not has_reel:
         return 'carousel'
     if has_reel and not has_car:

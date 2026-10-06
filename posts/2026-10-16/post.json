@@ -1,12 +1,17 @@
 {
-  "type": "reel",
+  "type": "carousel",
   "date": "2026-10-16",
   "source": "10-16 (금) 릴스 · 106킬로그램에서 달리기",
   "title": "106킬로그램에서 달리기",
   "caption": "caption.txt",
-  "video": "video.mp4",
-  "cover": "cover.jpg",
-  "frames": 8,
-  "duration_sec": 28.0,
-  "video_bytes": 3161679
+  "images": [
+    "01.jpg",
+    "02.jpg",
+    "03.jpg",
+    "04.jpg",
+    "05.jpg",
+    "06.jpg",
+    "07.jpg",
+    "08.jpg"
+  ]
 }
