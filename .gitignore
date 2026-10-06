@@ -5,3 +5,9 @@ __pycache__/
 .DS_Store
 # sync_content.py 가 변환 중에 쓰는 임시 폴더
 posts/.tmp-*/
+
+# cards/: 사진형 카드 제작 도구. 생성 사진(약 100MB)·합성 결과·로그는 올리지 않는다(결과물은 posts/ 에 들어감).
+cards/photos/
+cards/out/
+cards/_logs/
+cards/_bin/
