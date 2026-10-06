@@ -289,21 +289,44 @@ def cover_card(path, photo, eyebrow, title, sub, idx, total):
     return ok
 
 
-def body_card(path, photo, num, text, idx, total):
+def body_layout(text):
+    """문안 줄 수에 따라 사진 높이 비율과 글자 크기를 정한다. 반환: (사진 비율, 글꼴, 줄 목록, 줄 간격 px)
+      wrap 후 1~2줄 → 사진 56%, 글자 60→68 로 키움
+      3~4줄        → 사진 50%, 글자 60
+      5줄 이상      → 사진 42%, 글자를 줄여 5줄 안에(예전 규칙)"""
+    d = ImageDraw.Draw(Image.new('RGB', (8, 8)))
+    n60 = len(wrap(d, text, font(60), 920))
+    if n60 <= 2:
+        for fs in range(68, 59, -2):
+            f = font(fs)
+            lines = wrap(d, text, f, 920)
+            if len(lines) <= 2:
+                break
+        return 0.56, f, balance(d, text, f, 920, lines), round(fs * 1.28)
+    if n60 <= 4:
+        f = font(60)
+        return 0.50, f, balance(d, text, f, 920, wrap(d, text, f, 920)), round(60 * 1.28)
     ph = int(H * 0.42)
+    f, lines, lh = fit_text(d, text, 920, 58, 44, 5, H - 120 - ph - 128 - 20, big=5)
+    return 0.42, f, lines, lh
+
+
+def body_card(path, photo, num, text, idx, total):
+    ratio, f, lines, lh = body_layout(text)
+    ph = int(H * ratio)
     im = Image.new('RGB', (W, H), '#ffffff')
-    pic, ok = load_photo(photo, W, ph, vbias=0.30, face_at=0.52)     # 띠가 좁다: 얼굴을 창 가운데에
+    pic, ok = load_photo(photo, W, ph, vbias=0.30, face_at=0.50)
     im.paste(pic, (0, 0))
     brand_chip(im)
     d = ImageDraw.Draw(im)
-    y = ph + 50
+    # 번호(+짧은 파란 선)와 문안을 한 묶음으로, 사진 아래 ~ 바닥 글씨 위 영역의 세로 가운데에 둔다
+    top, bottom = ph, H - 120
+    head = 128                                   # 번호 윗선 → 문안 윗선
+    block = head + len(lines) * lh
+    y = top + max(0, (bottom - top - block) // 2)
     d.text((80, y), f'{num:02d}', font=font(56), fill=BLUE)
     d.rounded_rectangle((80, y + 84, 80 + 56, y + 90), 3, fill=BLUE)
-    top = y + 128
-    bottom = H - 150
-    f, lines, lh = fit_text(d, text, 920, 72, 44, 5, bottom - top, big=3)
-    block = len(lines) * lh
-    ty = top + max(0, round((bottom - top - block) * 0.30))   # 남는 자리의 위쪽 3할 지점(번호와 너무 멀지 않게)
+    ty = y + head
     for line in lines:
         d.text((80, ty), line, font=f, fill=INK)
         ty += lh
