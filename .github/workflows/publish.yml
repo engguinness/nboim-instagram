@@ -1,0 +1,74 @@
+# 매일 08:00(KST)에 오늘 게시물을 인스타에 올린다.
+# cron 은 UTC 기준: 23:00 UTC = 다음 날 08:00 KST.
+# 깃허브는 정시 cron 을 몇 분~수십 분 늦게 돌릴 때가 있다(혼잡 시간). 그래서 실제 게시는 08:00~08:30 사이가 될 수 있다.
+name: publish
+
+on:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '게시할 날짜 YYYY-MM-DD (비우면 오늘, 한국 시간)'
+        required: false
+        default: ''
+      dry:
+        description: '드라이런(실제로는 올리지 않고 무엇을 올릴지만 확인)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write      # published.json·token.enc 를 저장소에 커밋하기 위해
+
+# publish 와 refresh-token 이 같은 시각에 저장소를 고치지 않도록 한 줄로 세운다
+concurrency:
+  group: nboim-instagram-state
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Publish
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_TOKEN_KEY: ${{ secrets.IG_TOKEN_KEY }}
+          MEDIA_BASE: ${{ vars.MEDIA_BASE }}
+          IG_API_VERSION: ${{ vars.IG_API_VERSION }}
+          INPUT_DATE: ${{ github.event.inputs.date }}
+          INPUT_DRY: ${{ github.event.inputs.dry }}
+        run: |
+          args=()
+          if [ -n "$INPUT_DATE" ]; then args+=(--date "$INPUT_DATE"); fi
+          if [ "$INPUT_DRY" = "true" ]; then args+=(--dry); fi
+          python publish.py "${args[@]}"
+
+      # 게시에 성공했으면 posts/<날짜>/published.json 이 생겼을 것이다 — 저장소에 남겨 두 번 올리지 않게 한다.
+      # (게시는 됐는데 뒤의 단계가 실패해도 기록은 남도록 !cancelled() 로 둔다. 드라이런이면 바뀐 파일이 없어 아무것도 안 한다.)
+      - name: Commit result
+        if: ${{ !cancelled() }}
+        run: |
+          git config user.name "nboim-bot"
+          git config user.email "nboim-bot@users.noreply.github.com"
+          git add -A -- posts state
+          if git diff --cached --quiet; then
+            echo "커밋할 변경 없음"
+            exit 0
+          fi
+          git commit -m "publish: 게시 기록 (자동)"
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            sleep 5
+          done
+          echo "push 실패" >&2
+          exit 1

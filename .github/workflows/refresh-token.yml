@@ -1,0 +1,52 @@
+# 매주 월요일 10:00(KST) = 월요일 01:00 UTC 에 인스타 토큰(60일 만료)을 갱신해 state/token.enc 에 암호화해서 저장한다.
+name: refresh-token
+
+on:
+  schedule:
+    - cron: '0 1 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nboim-instagram-state
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Refresh token
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_TOKEN_KEY: ${{ secrets.IG_TOKEN_KEY }}
+          IG_API_VERSION: ${{ vars.IG_API_VERSION }}
+        run: python publish.py --refresh-token
+
+      - name: Commit token.enc
+        run: |
+          git config user.name "nboim-bot"
+          git config user.email "nboim-bot@users.noreply.github.com"
+          git add -A -- state
+          if git diff --cached --quiet; then
+            echo "커밋할 변경 없음"
+            exit 0
+          fi
+          git commit -m "refresh: 인스타 토큰 갱신 (자동)"
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            sleep 5
+          done
+          echo "push 실패" >&2
+          exit 1

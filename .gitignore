@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.DS_Store
+# sync_content.py 가 변환 중에 쓰는 임시 폴더
+posts/.tmp-*/
