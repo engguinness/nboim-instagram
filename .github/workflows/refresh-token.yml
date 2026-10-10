@@ -3,7 +3,7 @@ name: refresh-token
 
 on:
   schedule:
-    - cron: '0 1 * * 1'
+    - cron: '0 1 * * 1,4'   # 월·목 10:00 KST — 60일 토큰을 주 2회 연장(한 번 실패해도 여유)
   workflow_dispatch:
 
 permissions:
