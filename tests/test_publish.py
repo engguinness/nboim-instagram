@@ -528,3 +528,46 @@ def test_synced_post_is_publishable(tmp_path, monkeypatch, env):
     fake = install(monkeypatch, FakeIG())
     assert pb.main(['--date', '2026-10-07'], root=root, env=env) == 0
     assert fake.posts('/media')[-1][2]['caption'] == '연결 확인 캡션'
+
+
+# ---------------------------------------------------------------- 계정 번호 기록(state/account.json) — 아이디를 바꿔도 게시가 이어지게 (2026-10-15)
+
+def _account(root):
+    p = root / 'state' / 'account.json'
+    return json.loads(p.read_text(encoding='utf-8')) if p.exists() else None
+
+
+def test_first_publish_records_account_user_id(tmp_path, monkeypatch, env):
+    install(monkeypatch, FakeIG())
+    make_post(tmp_path)
+    assert pb.main(['--date', '2026-10-07'], root=tmp_path, env=env) == 0
+    rec = _account(tmp_path)
+    assert rec['user_id'] == '17841400000000000' and rec['username'] == pb.EXPECTED_USERNAME and rec['verified_at']
+
+
+def test_renamed_username_still_publishes_when_user_id_matches(tmp_path, monkeypatch, env, capsys):
+    (tmp_path / 'state').mkdir()
+    (tmp_path / 'state' / 'account.json').write_text(json.dumps({'user_id': '17841400000000000', 'username': pb.EXPECTED_USERNAME}), encoding='utf-8')
+    fake = install(monkeypatch, FakeIG(username='justenglish_new'))      # 아이디를 바꾼 뒤
+    d = make_post(tmp_path)
+    assert pb.main(['--date', '2026-10-07'], root=tmp_path, env=env) == 0
+    out = capsys.readouterr().out
+    assert '아이디 변경 감지' in out and '@justenglish_new' in out
+    assert fake.posts('/media_publish') and (d / 'published.json').exists()
+    assert _account(tmp_path)['username'] == 'justenglish_new'          # 기록도 새 아이디로
+
+
+def test_account_user_id_mismatch_refuses_even_if_username_expected(tmp_path, monkeypatch, env, capsys):
+    (tmp_path / 'state').mkdir()
+    (tmp_path / 'state' / 'account.json').write_text(json.dumps({'user_id': '17841499999999999', 'username': pb.EXPECTED_USERNAME}), encoding='utf-8')
+    fake = install(monkeypatch, FakeIG())
+    d = make_post(tmp_path)
+    assert pb.main(['--date', '2026-10-07'], root=tmp_path, env=env) == 1
+    assert '계정 번호' in capsys.readouterr().out
+    assert fake.posts('/media') == [] and not (d / 'published.json').exists()
+
+
+def test_refresh_bootstraps_account_record(tmp_path, monkeypatch, env):
+    install(monkeypatch, FakeIG())
+    assert pb.main(['--refresh-token'], root=tmp_path, env=env) == 0
+    assert _account(tmp_path)['user_id'] == '17841400000000000'

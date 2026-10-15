@@ -10,7 +10,8 @@
 
 토큰: 환경변수 IG_ACCESS_TOKEN(GitHub Secret). state/token.enc(IG_TOKEN_KEY 로 암호화)가 있으면 그게 우선이다 —
   매주 월요일 refresh 작업(--refresh-token)이 갱신해서 다시 쓴다. 토큰은 어떤 로그·출력에도 찍지 않는다.
-계정 확인: 토큰이 가리키는 계정이 justenglish_guinness 가 아니면 게시하지 않고 실패한다.
+계정 확인: state/account.json 에 기록된 계정 번호(user_id)와 토큰의 계정이 같아야 게시한다 — 인스타 아이디를 바꿔도 번호는
+  그대로라 계속 게시된다(2026-10-15). 기록이 없을 때(처음 한 번)만 아이디가 justenglish_guinness 인지 보고 번호를 기록한다.
 
 사용:
     python publish.py                       # 오늘(KST) 게시
@@ -54,6 +55,7 @@ DEDUPE_HOURS = 48            # 같은 캡션이 이 시간 안에 이미 올라�
 KDF_ITER = 200000
 
 STATE_FILE = Path('state') / 'token.enc'
+ACCOUNT_FILE = Path('state') / 'account.json'   # 계정 번호 기록 — 인스타 아이디를 바꿔도 번호는 그대로라 이걸로 계정을 확인한다
 
 
 class PublishError(RuntimeError):
@@ -217,18 +219,57 @@ def save_token_record(root, record, key):
     os.replace(tmp, path)
 
 
-def verify_account(token):
-    """토큰이 가리키는 계정을 확인한다. 반환: user_id. 계정이 다르면 PublishError(게시 안 함)."""
+def load_account(root):
+    """state/account.json 의 계정 기록 {user_id, username, verified_at}. 없거나 깨졌으면 None."""
+    p = Path(root) / ACCOUNT_FILE
+    if not p.is_file():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and d.get('user_id') else None
+
+
+def save_account(root, user_id, username):
+    p = Path(root) / ACCOUNT_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rec = {'user_id': str(user_id), 'username': username, 'verified_at': kst_now().strftime('%Y-%m-%d %H:%M')}
+    tmp = p.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    os.replace(tmp, p)
+
+
+def verify_account(token, root=None):
+    """토큰이 가리키는 계정을 확인한다. 반환: user_id. 계정이 다르면 PublishError(게시 안 함).
+
+    - state/account.json(계정 번호 기록)이 있으면 **계정 번호**로 확인한다. 인스타 아이디(username)를 바꿔도 번호는
+      그대로라 계속 게시되고, 바뀐 아이디는 기록에 고쳐 둔다(워크플로가 state/ 를 커밋).
+    - 기록이 없으면(처음 한 번) 아이디가 EXPECTED_USERNAME 과 같을 때만 통과하고, 그때 번호를 기록한다.
+    """
+    root = Path(root) if root else ROOT
     st, d = api_get(f'{IG_API}/me', {'fields': 'user_id,username'}, token)
     if st != 200 or 'error' in d:
         raise PublishError('토큰으로 계정을 확인하지 못함: ' + api_error_text(d, st))
     username = d.get('username') or ''
-    if username != EXPECTED_USERNAME:
-        raise PublishError(f'토큰의 계정이 {EXPECTED_USERNAME} 가 아님(조회된 계정: {username or "알 수 없음"}) — 게시하지 않습니다')
     user_id = d.get('user_id') or d.get('id')
     if not user_id:
         raise PublishError('계정 id 를 받지 못함')
-    return str(user_id)
+    user_id = str(user_id)
+    rec = load_account(root)
+    if rec:
+        if str(rec['user_id']) != user_id:
+            raise PublishError(f'토큰의 계정 번호({user_id})가 기록된 계정(@{rec.get("username")}, 번호 {rec["user_id"]})과 다름 — 게시하지 않습니다')
+        if username and username != rec.get('username'):
+            log(f'아이디 변경 감지: @{rec.get("username")} → @{username} (계정 번호 {user_id} 동일 — 계속 게시합니다)')
+            save_account(root, user_id, username)
+        log(f'계정 확인 : @{username or rec.get("username")} OK (번호 {user_id})')
+        return user_id
+    if username != EXPECTED_USERNAME:
+        raise PublishError(f'토큰의 계정이 {EXPECTED_USERNAME} 가 아님(조회된 계정: {username or "알 수 없음"}) — 게시하지 않습니다')
+    save_account(root, user_id, username)
+    log(f'계정 확인 : @{username} OK (번호 {user_id} 를 state/account.json 에 기록 — 앞으로는 번호로 확인)')
+    return user_id
 
 
 def refresh_token(root, env=None):
@@ -240,8 +281,7 @@ def refresh_token(root, env=None):
         return 1
     token, source = load_token(root, env)
     log(f'토큰 갱신 시도 (현재 토큰 출처: {source})')
-    verify_account(token)                      # 갱신 전에 계정부터 확인 — 설정 확인용으로 수동 실행해도 의미가 있게
-    log(f'계정 확인 : @{EXPECTED_USERNAME} OK')
+    verify_account(token, root)                # 갱신 전에 계정부터 확인 — 설정 확인용으로 수동 실행해도 의미가 있게
     st, d = api_get(REFRESH_URL, {'grant_type': 'ig_refresh_token'}, token)
     if st != 200 or 'error' in d or not d.get('access_token'):
         msg = api_error_text(d, st)
@@ -252,7 +292,7 @@ def refresh_token(root, env=None):
         return 1
     new_token = d['access_token']
     register_secret(new_token)
-    verify_account(new_token)
+    verify_account(new_token, root)
     now = kst_now()
     expires_in = int(d.get('expires_in') or 0)
     secret = (env.get('IG_ACCESS_TOKEN') or '').strip()
@@ -530,8 +570,7 @@ def run(args, root=None, env=None):
 
     token, source = load_token(root, env)
     log(f'토큰 출처 : {source}')
-    user_id = verify_account(token)
-    log(f'계정 확인 : @{EXPECTED_USERNAME} OK')
+    user_id = verify_account(token, root)
 
     problems, warns = check_media_urls(urls, kinds)
     for w in warns:
