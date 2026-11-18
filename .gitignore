@@ -11,3 +11,9 @@ cards/photos/
 cards/out/
 cards/_logs/
 cards/_bin/
+
+# 릴스: 유튜브 공개 전이라 보류한 편(12-07 점검 루틴이 공개 확인 뒤 reels/ 로 옮김), Cloudflare Pages 배포용 임시 폴더
+reels_hold/
+.pages_build/
+.wrangler/
+reels_dropped/

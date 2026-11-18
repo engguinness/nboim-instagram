@@ -1,0 +1,82 @@
+# 매일 저녁 릴스(reels/<날짜>/)를 인스타에 올린다. 카드뉴스(publish.yml, 08:00)와는 별개 경로.
+# cron 은 UTC 기준: 09:13 UTC = 같은 날 18:13 KST (정각을 피해 혼잡을 줄임).
+# 이 저장소의 깃허브 예약 실행은 실제로 1시간 반~4시간 넘게 늦게 돈다(nboim-bot 커밋 시각 실측, 토큰 갱신은 최대 7시간).
+# 그래서 실제 게시는 대체로 18시~22시대이고, 아주 늦어도 날짜는 그날 몫이다
+# — 예약 실행은 대상 날짜를 (한국 시간 지금 − 12시간)의 날짜로 잡는다(publish.py resolve_date).
+# 영상·표지 주소는 Cloudflare Pages 프로젝트 nboim-reels(tools/deploy_pages.sh 로 배포) — raw.githubusercontent 는 mp4 를 octet-stream 으로 준다.
+name: reels
+
+on:
+  schedule:
+    - cron: '13 9 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '게시할 날짜 YYYY-MM-DD (비우면 오늘, 한국 시간. 예약 실행만 지금−12시간의 날짜)'
+        required: false
+        default: ''
+      dry:
+        description: '드라이런(실제로는 올리지 않고 무엇을 올릴지만 확인)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write      # reels/<날짜>/published.json·token.enc 를 저장소에 커밋하기 위해
+
+# publish·refresh-token 과 같은 줄 — 상태 커밋이 겹치지 않게
+concurrency:
+  group: nboim-instagram-state
+  cancel-in-progress: false
+
+jobs:
+  reels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}     # 재실행·대기 실행도 시작 시점의 최신 main(앞 실행의 published.json 포함)을 본다
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Publish reel
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_TOKEN_KEY: ${{ secrets.IG_TOKEN_KEY }}
+          IG_API_VERSION: ${{ vars.IG_API_VERSION }}
+          REEL_MEDIA_BASE: https://nboim-reels.pages.dev
+          INPUT_DATE: ${{ github.event.inputs.date }}
+          INPUT_DRY: ${{ github.event.inputs.dry }}
+        run: |
+          args=(--root reels)
+          if [ -n "$INPUT_DATE" ]; then args+=(--date "$INPUT_DATE"); fi
+          if [ "$INPUT_DRY" = "true" ]; then args+=(--dry); fi
+          python publish.py "${args[@]}"
+
+      # 게시에 성공했으면 reels/<날짜>/published.json 이 생겼을 것이다 — 저장소에 남겨 두 번 올리지 않게 한다.
+      - name: Commit result
+        if: ${{ !cancelled() }}
+        run: |
+          git config user.name "nboim-bot"
+          git config user.email "nboim-bot@users.noreply.github.com"
+          git add -A -- reels state
+          if git diff --cached --quiet; then
+            echo "커밋할 변경 없음"
+            exit 0
+          fi
+          git commit -m "reels: 게시 기록 (자동)"
+          for i in 1 2 3; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}"; then
+              git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            else
+              git rebase --abort || true     # 충돌 등으로 멈춘 rebase 를 되돌린 뒤 다시 시도
+            fi
+            sleep 5
+          done
+          echo "push 실패" >&2
+          exit 1

@@ -18,6 +18,17 @@
     python publish.py --date 2026-10-07     # 날짜 지정
     python publish.py --dry                 # API 호출 없이 무엇을 올릴지만 출력(미디어 URL 확인은 함)
     python publish.py --refresh-token       # 토큰 갱신 → state/token.enc
+    python publish.py --root reels          # 릴스 경로: reels/<날짜>/ 를 읽는다(reels.yml 이 매일 저녁 18:13 KST 예약으로 호출)
+
+릴스 경로(--root reels): 영상·표지 주소는 raw.githubusercontent 가 mp4 를 octet-stream 으로 주기 때문에
+  Cloudflare Pages 전용 프로젝트(nboim-reels)의 <REEL_MEDIA_BASE>/reels/<날짜>/video.mp4 꼴로 만든다
+  (REEL_MEDIA_BASE 기본 https://nboim-reels.pages.dev, 배포는 tools/deploy_pages.sh).
+  컨테이너를 만들기 전에 200·video/mp4(표지는 image/jpeg)를 확인하고, 안 되면 몇 번 기다려 다시 본다. 끝내 안 되면 게시하지 않고 실패.
+  날짜: 예약 실행(GITHUB_EVENT_NAME=schedule)이고 --date 가 없으면 (한국 시간 지금 − 12시간)의 날짜 — 깃허브 예약이 몇 시간 늦게 돌아도 그날 몫을 올린다.
+  이중 게시 방지(reels/<날짜>/published.json·최근 캡션 대조)는 카드와 같고, 카드(posts/)와는 서로 막지 않는다.
+  릴스는 더 엄격하다: 최근 게시물 조회가 실패하면 게시하지 않고 실패(하루 빠지는 편이 두 번 올라가는 것보다 낫다),
+  발행 결과를 알 수 없으면(연결 오류·타임아웃·5xx) 10초 간격 6번 최근 글을 다시 보고, 끝내 못 찾으면 published.json 에
+  status=unknown 을 남겨 자동 재게시를 막는다(사람이 확인).
 
 종료 코드: 0 = 게시함·게시물 없음·이미 게시됨·드라이런 / 1 = 실패(Actions 가 실패 메일을 보낸다)
 """
@@ -50,6 +61,12 @@ USER_AGENT = 'nboim-instagram/1.0'
 
 MAX_CAROUSEL = 10
 CHILD_POLL = (30, 3)         # 이미지 컨테이너: (최대 횟수, 간격 초) — 보통 바로 끝난다
+CONTENT_DIRS = ('posts', 'reels')   # posts = 카드뉴스(기본), reels = 릴스 경로
+REEL_MEDIA_BASE_DEFAULT = 'https://nboim-reels.pages.dev'   # 릴스 영상·표지 호스팅: Cloudflare Pages 프로젝트 nboim-reels (tools/deploy_pages.sh)
+REEL_URL_WAIT = (8, 20)      # 릴스 미디어 주소 확인(실제 게시): (최대 횟수, 간격 초) — 배포 직후 엣지 반영이 늦을 수 있다
+REEL_URL_WAIT_DRY = (3, 10)  # 릴스 드라이런의 주소 확인: 짧게
+REEL_LATE_HOURS = 12         # 예약 실행의 대상 날짜 = (한국 시간 지금 − 이 시간)의 날짜
+REEL_UNKNOWN_RECHECK = (6, 10)   # 발행 결과를 모를 때 최근 글 재확인: (횟수, 간격 초)
 REEL_POLL = (60, 5)          # 릴스 컨테이너: 5초 간격 최대 60번 = 5분
 DEDUPE_HOURS = 48            # 같은 캡션이 이 시간 안에 이미 올라가 있으면 다시 안 올린다
 KDF_ITER = 200000
@@ -60,6 +77,10 @@ ACCOUNT_FILE = Path('state') / 'account.json'   # 계정 번호 기록 — 인�
 
 class PublishError(RuntimeError):
     pass
+
+
+class PublishUnknown(PublishError):
+    """media_publish 가 연결 오류·타임아웃·5xx 처럼 결과를 알 수 없게 끝남(올라갔을 수도 있음)."""
 
 
 # ---------------------------------------------------------------- 로그·비밀값 가리기
@@ -358,15 +379,33 @@ def media_base(repo=None, env=None):
     return f'https://raw.githubusercontent.com/{repo}/{branch}'
 
 
-def media_url(base, date, filename):
-    return f'{base}/posts/{date}/{quote(filename)}'
+def media_url(base, date, filename, section='posts'):
+    return f'{base}/{section}/{date}/{quote(filename)}'
 
 
-def check_media_urls(urls, kinds):
-    """공개 URL 확인. 반환: (문제 목록, 경고 목록). 문제 = 200 이 아님(게시 중단 사유), 경고 = content-type 이상."""
+def reel_media_base(env=None):
+    """릴스 영상·표지 주소의 앞부분. 환경변수 REEL_MEDIA_BASE, 없으면 REEL_MEDIA_BASE_DEFAULT(Cloudflare Pages)."""
+    env = os.environ if env is None else env
+    return (env.get('REEL_MEDIA_BASE') or '').strip().rstrip('/') or REEL_MEDIA_BASE_DEFAULT
+
+
+def resolve_date(args, env, is_reels_root):
+    """대상 날짜와 그 규칙 설명. 릴스 예약 실행(--date 없음)은 (한국 시간 지금 − REEL_LATE_HOURS 시간)의 날짜."""
+    if args.date:
+        return args.date, '--date 로 지정'
+    now = kst_now()
+    if is_reels_root and (env.get('GITHUB_EVENT_NAME') or '') == 'schedule':
+        d = (now - datetime.timedelta(hours=REEL_LATE_HOURS)).date().isoformat()
+        return d, f'예약 실행 — 한국 시간 지금({now.strftime("%Y-%m-%d %H:%M")}) − {REEL_LATE_HOURS}시간의 날짜(늦게 돌아도 그날 몫)'
+    return now.date().isoformat(), '오늘(한국 시간)'
+
+
+def check_media_urls(urls, kinds, strict=False):
+    """공개 URL 확인. 반환: (문제 목록, 경고 목록). 문제 = 200 이 아님(게시 중단 사유), 경고 = content-type 이상.
+    strict=True(릴스) 이면 content-type 이 video/·image/ 가 아닌 것도 문제로 본다."""
     problems, warns = [], []
     for url, kind in zip(urls, kinds):
-        short = url.rsplit('/posts/', 1)[-1]
+        short = re.split(r'/(?:posts|reels)/', url, maxsplit=1)[-1]
         try:
             st, ctype = _head(url)
         except PublishError as e:
@@ -376,8 +415,24 @@ def check_media_urls(urls, kinds):
             problems.append(f'{short}: HTTP {st}')
             continue
         if not ctype.startswith(kind + '/'):
+            if strict:
+                problems.append(f'{short}: Content-Type {ctype or "없음"} ({kind}/ 아님)')
+                continue
             hint = ' — raw.githubusercontent 는 mp4 를 application/octet-stream 으로 줄 수 있음(README: GitHub Pages 로 전환)' if kind == 'video' else ''
             warns.append(f'{short}: Content-Type {ctype or "없음"} ({kind}/ 아님){hint}')
+    return problems, warns
+
+
+def check_media_urls_wait(urls, kinds, strict=True, waits=None):
+    """check_media_urls 를 문제가 없어질 때까지 간격을 두고 다시 본다. 반환: (문제, 경고) — 마지막 시도의 것."""
+    tries, gap = waits or REEL_URL_WAIT
+    for i in range(tries):
+        problems, warns = check_media_urls(urls, kinds, strict=strict)
+        if not problems:
+            return problems, warns
+        if i < tries - 1:
+            log(f'미디어 주소 아직 준비 안 됨({i + 1}/{tries}) — {gap}초 뒤 다시 확인: ' + '; '.join(problems))
+            time.sleep(gap)
     return problems, warns
 
 
@@ -471,6 +526,38 @@ def do_publish(token, user_id, creation_id):
     return d['id']
 
 
+# 인스타는 서버·일시 오류도 HTTP 400 으로 줄 때가 있다 — 이런 응답은 '분명한 거절'이 아니라 결과 불명으로 본다(올라갔을 수 있음).
+TRANSIENT_CODES = {-1, -2, 1, 2}
+TRANSIENT_SUBCODES = {2207001, 2207008, 2207053}
+
+
+def _is_transient_error(body):
+    err = body.get('error') if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        return False
+    if err.get('is_transient') is True:
+        return True
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    return _int(err.get('code')) in TRANSIENT_CODES or _int(err.get('error_subcode')) in TRANSIENT_SUBCODES
+
+
+def do_publish_reel(token, user_id, creation_id):
+    """릴스 발행. 결과를 알 수 없는 끝(연결 오류·타임아웃·5xx·id 없는 200·일시 오류 표시가 붙은 4xx)은 PublishUnknown, 분명한 거절(4xx)은 PublishError."""
+    try:
+        st, d = api_post(f'{IG_API}/{user_id}/media_publish', {'creation_id': creation_id}, token)
+    except PublishError as e:
+        raise PublishUnknown('media_publish 결과를 알 수 없음: ' + str(e))
+    if st >= 500 or (st == 200 and 'id' not in d) or _is_transient_error(d):
+        raise PublishUnknown('media_publish 결과를 알 수 없음: ' + api_error_text(d, st))
+    if st != 200 or 'id' not in d:
+        raise PublishError('media_publish 실패: ' + api_error_text(d, st))
+    return d['id']
+
+
 def wait_permalink(token, media_id, tries=4, pause=3):
     for i in range(tries):
         try:
@@ -490,7 +577,7 @@ def _norm_caption(s):
 
 def find_recent_same_caption(token, user_id, caption, now=None):
     """최근 게시물 중 같은 캡션이 DEDUPE_HOURS 시간 안에 올라간 게 있으면 그 글(dict), 없으면 None.
-    조회가 실패하면 PublishError — 호출부가 경고로 처리한다."""
+    조회가 실패하면 PublishError — 카드는 호출부가 경고로 넘기고, 릴스는 게시하지 않고 실패한다."""
     st, d = api_get(f'{IG_API}/{user_id}/media', {'fields': 'id,caption,permalink,timestamp', 'limit': 10}, token)
     if st != 200 or 'error' in d:
         raise PublishError('최근 게시물 조회 실패: ' + api_error_text(d, st))
@@ -514,6 +601,21 @@ def write_published(post_dir, media_id, permalink):
     return rec
 
 
+def write_unknown(post_dir, creation_id, note):
+    """발행 결과를 모를 때의 기록 — 이 파일이 있으면 자동으로 다시 올리지 않는다(사람이 인스타를 확인)."""
+    rec = {'status': 'unknown', 'creation_id': creation_id, 'at': kst_now().isoformat(timespec='seconds'), 'note': note}
+    (Path(post_dir) / 'published.json').write_text(json.dumps(rec, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    return rec
+
+
+def read_published(post_dir):
+    try:
+        d = json.loads((Path(post_dir) / 'published.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
 # ---------------------------------------------------------------- 본 흐름
 
 def describe_plan(date, post, urls, env, root):
@@ -522,7 +624,10 @@ def describe_plan(date, post, urls, env, root):
     log(f'날짜     : {date} ({TZ_NAME})')
     kind = '릴스(REELS)' if post['type'] == 'reel' else f'캐러셀 {len(post["images"])}장' if len(post['images']) > 1 else '사진 1장'
     log(f'종류     : {kind}')
-    log(f'원본     : {post.get("source", "")}')
+    src = post.get('source', '')
+    if isinstance(src, dict):
+        src = src.get('title') or src.get('youtube_id', '')
+    log(f'원본     : {src}')
     log(f'캡션     : {len(caption)}자 — "{first[:40]}{"…" if len(first) > 40 else ""}"')
     for u in urls:
         log(f'미디어   : {u}')
@@ -535,23 +640,40 @@ def describe_plan(date, post, urls, env, root):
 def run(args, root=None, env=None):
     root = Path(root) if root else ROOT
     env = os.environ if env is None else env
-    date = args.date or kst_now().date().isoformat()
-    post_dir = root / 'posts' / date
+    section = getattr(args, 'root', None) or 'posts'
+    if section not in CONTENT_DIRS:
+        raise PublishError(f'--root 는 {" 또는 ".join(CONTENT_DIRS)} 중 하나여야 합니다: {section!r}')
+    is_reels_root = section == 'reels'
+    if is_reels_root:
+        date, why = resolve_date(args, env, True)
+        log(f'대상 날짜 : {date} — {why}')
+    else:
+        date = args.date or kst_now().date().isoformat()
+    post_dir = root / section / date
 
     if not (post_dir / 'post.json').is_file():
-        log(f'{date}: 오늘 게시물 없음 — 아무것도 하지 않습니다.')
+        log(f'{date}: 오늘 게시물 없음 — 아무것도 하지 않습니다.' if not is_reels_root
+            else f'{date}: 오늘 릴스 없음({section}/{date}/post.json 없음) — 아무것도 하지 않습니다.')
+        return 0
+    if is_reels_root and (post_dir / 'published.json').is_file() and read_published(post_dir).get('status') == 'unknown':
+        log(f'{date}: 게시 여부 확인 필요 — 다시 올리지 않음(published.json status=unknown). 인스타를 확인한 뒤 이 파일을 지우거나 실제 기록으로 바꾸세요.')
         return 0
     if (post_dir / 'published.json').is_file():
         log(f'{date}: 이미 게시됨(published.json) — 다시 올리지 않습니다.')
         return 0
 
     post = load_post(post_dir)
-    base = media_base(args.repo, env)
+    if is_reels_root and post['type'] != 'reel':
+        raise PublishError(f'reels/ 아래 게시물은 type 이 reel 이어야 함(현재: {post["type"]!r})')
+    if is_reels_root:
+        base = reel_media_base(env)
+    else:
+        base = media_base(args.repo, env)
     if post['type'] == 'reel':
         files, kinds = [post['video'], post['cover']], ['video', 'image']
     else:
         files, kinds = post['images'], ['image'] * len(post['images'])
-    urls = [media_url(base, date, f) for f in files]
+    urls = [media_url(base, date, f, section) for f in files]
 
     if args.dry:
         log('[드라이런] 인스타 API 를 호출하지 않습니다.')
@@ -559,12 +681,16 @@ def run(args, root=None, env=None):
         if args.no_url_check:
             log('미디어 URL 확인: 건너뜀(--no-url-check)')
         else:
-            problems, warns = check_media_urls(urls, kinds)
+            if is_reels_root:
+                problems, warns = check_media_urls_wait(urls, kinds, strict=True, waits=REEL_URL_WAIT_DRY)
+            else:
+                problems, warns = check_media_urls(urls, kinds, strict=False)
             for w in warns:
                 log(f'경고     : {w}')
             for p in problems:
                 log(f'문제     : {p}')
-            log('미디어 URL 확인: ' + ('모두 200' if not problems else f'{len(problems)}개 접근 안 됨 — 저장소를 푸시했는지·공개 저장소인지 확인'))
+            hint = 'tools/deploy_pages.sh 로 배포했는지 확인' if is_reels_root else '저장소를 푸시했는지·공개 저장소인지 확인'
+            log('미디어 URL 확인: ' + ('모두 200' if not problems else f'{len(problems)}개 접근 안 됨 — {hint}'))
         log('[드라이런] 끝 — 실제 게시는 하지 않았습니다.')
         return 0
 
@@ -572,7 +698,10 @@ def run(args, root=None, env=None):
     log(f'토큰 출처 : {source}')
     user_id = verify_account(token, root)
 
-    problems, warns = check_media_urls(urls, kinds)
+    if is_reels_root:
+        problems, warns = check_media_urls_wait(urls, kinds, strict=True)
+    else:
+        problems, warns = check_media_urls(urls, kinds)
     for w in warns:
         log(f'경고: {w}')
     if problems:
@@ -582,6 +711,9 @@ def run(args, root=None, env=None):
     try:
         dup = find_recent_same_caption(token, user_id, caption)
     except PublishError as e:
+        if is_reels_root:
+            # 릴스: 이중 게시가 더 나쁘다 — 중복 여부를 모르면 올리지 않는다(내일 다시 돈다고 해도 그날 몫은 빠진다)
+            raise PublishError(f'중복 확인을 못 해 게시하지 않습니다({e})')
         log(f'경고: 중복 확인을 못 했습니다({e}) — 계속 진행합니다.')
         dup = None
     if dup:
@@ -596,7 +728,25 @@ def run(args, root=None, env=None):
     log(f'컨테이너 준비 완료({creation_id}) — 발행합니다.')
 
     try:
-        media_id = do_publish(token, user_id, creation_id)
+        media_id = do_publish_reel(token, user_id, creation_id) if is_reels_root else do_publish(token, user_id, creation_id)
+    except PublishUnknown as e:
+        tries, gap = REEL_UNKNOWN_RECHECK
+        log(f'발행 결과를 알 수 없음({e}) — {gap}초 간격으로 최근 글을 {tries}번 확인합니다.')
+        found = None
+        for _ in range(tries):
+            time.sleep(gap)
+            try:
+                found = find_recent_same_caption(token, user_id, caption)
+            except PublishError:
+                found = None
+            if found:
+                break
+        if found:
+            log('최근 글에서 같은 캡션을 찾음 — 성공으로 처리합니다.')
+            write_published(post_dir, found.get('id', ''), found.get('permalink', ''))
+            return 0
+        write_unknown(post_dir, creation_id, f'발행 응답을 못 받았고 최근 글에서도 못 찾음: {redact(e)}'[:300])
+        raise PublishError('게시 여부를 알 수 없어 published.json(status=unknown)을 남기고 멈춥니다 — 인스타를 확인하세요. 자동으로 다시 올리지 않습니다.')
     except PublishError as e:
         # 응답을 못 받았어도 실제로는 올라갔을 수 있다 — 잠시 뒤 최근 글에서 같은 캡션을 찾아 본다.
         time.sleep(5)
@@ -622,8 +772,10 @@ def build_parser():
     ap = argparse.ArgumentParser(description='앤보임 인스타 자동 게시기')
     ap.add_argument('--date', type=valid_date, help='게시할 날짜 YYYY-MM-DD (기본: 오늘, Asia/Seoul)')
     ap.add_argument('--dry', action='store_true', help='API 호출 없이 무엇을 올릴지만 출력')
-    ap.add_argument('--repo', help='owner/repo — 미디어 URL 용(기본: GITHUB_REPOSITORY 환경변수)')
+    ap.add_argument('--repo', help='owner/repo — 카드 미디어 URL 용(기본: GITHUB_REPOSITORY 환경변수)')
     ap.add_argument('--no-url-check', action='store_true', help='--dry 에서 미디어 URL 확인(HEAD 요청)도 하지 않음')
+    ap.add_argument('--root', choices=CONTENT_DIRS, default='posts',
+                    help='읽을 폴더: posts(카드뉴스, 기본) 또는 reels(릴스 — Cloudflare Pages 주소 사용)')
     ap.add_argument('--refresh-token', action='store_true', help='토큰을 갱신해 state/token.enc 로 저장(매주 월요일 작업)')
     return ap
 

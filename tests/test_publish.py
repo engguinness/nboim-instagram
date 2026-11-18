@@ -571,3 +571,285 @@ def test_refresh_bootstraps_account_record(tmp_path, monkeypatch, env):
     install(monkeypatch, FakeIG())
     assert pb.main(['--refresh-token'], root=tmp_path, env=env) == 0
     assert _account(tmp_path)['user_id'] == '17841400000000000'
+
+
+# ---------------------------------------------------------------- 릴스 경로(--root reels)
+
+PAGES = 'https://nboim-reels.pages.dev/reels'
+
+
+def make_reel(root, date='2026-11-19', caption='릴스 첫 줄\n\n#태그'):
+    d = Path(root) / 'reels' / date
+    d.mkdir(parents=True)
+    (d / 'caption.txt').write_text(caption + '\n', encoding='utf-8')
+    (d / 'video.mp4').write_bytes(b'mp4')
+    (d / 'cover.jpg').write_bytes(b'\xff\xd8jpeg')
+    post = {'type': 'reel', 'date': date, 'video': 'video.mp4', 'cover': 'cover.jpg', 'caption': 'caption.txt'}
+    (d / 'post.json').write_text(json.dumps(post, ensure_ascii=False), encoding='utf-8')
+    return d
+
+
+@pytest.fixture
+def renv(env):
+    return dict(env)
+
+
+def test_reel_media_urls_use_pages_base_and_env_override():
+    assert pb.REEL_MEDIA_BASE_DEFAULT == 'https://nboim-reels.pages.dev'
+    e = {'GITHUB_REPOSITORY': REPO, 'MEDIA_BASE': 'https://x.github.io/y'}
+    base = pb.reel_media_base(e)                              # MEDIA_BASE(카드용) 는 릴스에 영향 없음, SHA 도 필요 없음
+    assert base == 'https://nboim-reels.pages.dev'
+    assert pb.media_url(base, '2026-11-19', 'video.mp4', 'reels') == f'{PAGES}/2026-11-19/video.mp4'
+    assert pb.reel_media_base({'REEL_MEDIA_BASE': 'https://r.example/x/'}) == 'https://r.example/x'
+    assert pb.media_url('B', '2026-11-19', '01.jpg') == 'B/posts/2026-11-19/01.jpg'     # 카드 기본 불변
+    assert 'jsdelivr' not in open(pb.__file__, encoding='utf-8').read().lower()
+
+
+def test_reel_date_rule_schedule_minus_12h_otherwise_today(monkeypatch):
+    KST = datetime.timezone(datetime.timedelta(hours=9))
+    def at(*a):
+        monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(*a, tzinfo=KST))
+    ns = lambda date=None: type('A', (), {'date': date})()
+    sched = {'GITHUB_EVENT_NAME': 'schedule'}
+    at(2026, 11, 19, 18, 13)                                  # 제때
+    assert pb.resolve_date(ns(), sched, True)[0] == '2026-11-19'
+    at(2026, 11, 20, 1, 13)                                   # 7시간 늦음 — 그날 몫
+    assert pb.resolve_date(ns(), sched, True)[0] == '2026-11-19'
+    at(2026, 11, 20, 11, 59)                                  # 한계 직전(11시간 46분 늦음)
+    assert pb.resolve_date(ns(), sched, True)[0] == '2026-11-19'
+    at(2026, 11, 20, 12, 0)                                   # 정오가 지나면 다음 날 몫
+    assert pb.resolve_date(ns(), sched, True)[0] == '2026-11-20'
+    d, why = pb.resolve_date(ns(), {'GITHUB_EVENT_NAME': 'workflow_dispatch'}, True)    # 수동 실행은 그대로
+    assert d == '2026-11-20' and '오늘' in why
+    assert pb.resolve_date(ns('2026-12-01'), sched, True)[0] == '2026-12-01'            # --date 우선
+    at(2026, 11, 20, 1, 13)
+    assert pb.resolve_date(ns(), sched, False)[0] == '2026-11-20'                       # 카드 경로는 불변
+
+
+def test_reel_scheduled_run_picks_previous_day_when_late_and_logs_rule(tmp_path, monkeypatch, renv, capsys):
+    KST = datetime.timezone(datetime.timedelta(hours=9))
+    monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(2026, 11, 20, 2, 30, tzinfo=KST))
+    fake = install(monkeypatch, FakeIG())
+    d = make_reel(tmp_path, '2026-11-19')
+    assert pb.main(['--root', 'reels'], root=tmp_path, env=dict(renv, GITHUB_EVENT_NAME='schedule')) == 0
+    out = capsys.readouterr().out
+    assert '대상 날짜 : 2026-11-19' in out and '예약 실행' in out and (d / 'published.json').exists()
+
+
+def test_root_reels_reads_reels_dir_not_posts(tmp_path, monkeypatch, renv, capsys):
+    fake = install(monkeypatch, FakeIG())
+    make_post(tmp_path, date='2026-11-19')                   # 같은 날 카드가 있어도
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert fake.calls == [] and '릴스 없음' in capsys.readouterr().out    # reels/ 가 비었으니 아무것도 안 함
+    make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19', '--dry', '--no-url-check'], root=tmp_path, env=renv) == 0
+    out = capsys.readouterr().out
+    assert '릴스(REELS)' in out and f'{PAGES}/2026-11-19/video.mp4' in out and f'{PAGES}/2026-11-19/cover.jpg' in out
+    assert fake.calls == []
+
+
+def test_reels_dry_run_needs_no_repo_or_sha_and_makes_no_calls(tmp_path, monkeypatch, env, capsys):
+    fake = install(monkeypatch, FakeIG())
+    make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19', '--dry', '--no-url-check'],
+                   root=tmp_path, env={}) == 0
+    assert fake.calls == [] and f'{PAGES}/2026-11-19/video.mp4' in capsys.readouterr().out
+
+
+def test_reels_dry_run_url_check_waits_and_retries(tmp_path, monkeypatch, renv, capsys):
+    fake = install(monkeypatch, FakeIG())
+    make_reel(tmp_path)
+    state = {'n': 0}
+    orig = fake.head
+    def flaky(url, **kw):
+        if url.endswith('video.mp4'):
+            state['n'] += 1
+            if state['n'] < 3:
+                fake.calls.append(('HEAD', url, None))
+                return Resp(404)
+        return orig(url, **kw)
+    fake.head = flaky
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19', '--dry'], root=tmp_path, env=renv) == 0
+    out = capsys.readouterr().out
+    assert '모두 200' in out and state['n'] == 3 and fake.graph_calls == []
+    # 끝내 안 되면 정해진 횟수(3번)만 보고 문제로 표시(드라이런이라 종료 코드는 0)
+    fake2 = install(monkeypatch, FakeIG(media_status=404))
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19', '--dry'], root=tmp_path, env=renv) == 0
+    assert len([c for c in fake2.calls if c[0] == 'HEAD' and c[1].endswith('video.mp4')]) == pb.REEL_URL_WAIT_DRY[0] == 3
+    assert '접근 안 됨' in capsys.readouterr().out
+
+
+def test_reel_publish_uses_pages_urls_and_writes_published_under_reels(tmp_path, monkeypatch, renv):
+    fake = install(monkeypatch, FakeIG())
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    f = fake.posts('/media')[0][2]
+    assert f['media_type'] == 'REELS' and f['video_url'] == f'{PAGES}/2026-11-19/video.mp4'
+    assert f['cover_url'] == f'{PAGES}/2026-11-19/cover.jpg'
+    assert (d / 'published.json').exists() and not (tmp_path / 'posts').exists()
+    # 두 번째 실행: 이미 게시됨 → 요청 0건
+    n = len(fake.calls)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert len(fake.calls) == n
+
+
+def test_reel_wrong_content_type_waits_then_fails_safely(tmp_path, monkeypatch, renv, capsys):
+    fake = install(monkeypatch, FakeIG(video_ctype='application/octet-stream'))
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 1
+    assert fake.posts('/media') == [] and not fake.posts('/media_publish') and not (d / 'published.json').exists()
+    heads = [c for c in fake.calls if c[0] == 'HEAD' and c[1].endswith('video.mp4')]
+    assert len(heads) == pb.REEL_URL_WAIT[0]                  # 여러 번 다시 봄
+    assert 'Content-Type' in capsys.readouterr().out
+
+
+def test_reel_url_becomes_ready_after_retries(tmp_path, monkeypatch, renv):
+    fake = install(monkeypatch, FakeIG())
+    make_reel(tmp_path)
+    state = {'n': 0}
+    orig = fake.head
+    def flaky(url, **kw):
+        if url.endswith('video.mp4'):
+            state['n'] += 1
+            if state['n'] < 3:
+                fake.calls.append(('HEAD', url, None))
+                return Resp(404)
+        return orig(url, **kw)
+    fake.head = flaky
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert fake.published
+
+
+def test_reel_same_caption_dedupe_and_card_same_day_independent(tmp_path, monkeypatch, renv):
+    now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+0000')
+    recent = [{'id': 'old', 'caption': '릴스 첫 줄\n\n#태그', 'permalink': 'https://www.instagram.com/p/OLD/', 'timestamp': now}]
+    fake = install(monkeypatch, FakeIG(recent=recent))
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert fake.posts('/media') == [] and (d / 'published.json').exists()      # 중복 → 올리지 않고 기록만
+    # 같은 날 카드: reels 의 published.json 이 posts/ 를 막지 않는다
+    fake2 = install(monkeypatch, FakeIG())
+    make_post(tmp_path, date='2026-11-19')
+    assert pb.main(['--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert fake2.published and (tmp_path / 'posts' / '2026-11-19' / 'published.json').exists()
+
+
+def test_reel_dedupe_lookup_failure_aborts_but_card_continues(tmp_path, monkeypatch, renv, capsys):
+    class NoRecent(FakeIG):
+        def get(self, url, params=None, **kw):
+            if url.endswith('/media'):
+                return Resp(500, {'error': {'message': 'boom', 'code': 2}})
+            return super().get(url, params, **kw)
+    fake = install(monkeypatch, NoRecent())
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 1
+    assert fake.posts('/media') == [] and not (d / 'published.json').exists()
+    assert '중복 확인을 못 해 게시하지 않습니다' in capsys.readouterr().out
+    fake2 = install(monkeypatch, NoRecent())                  # 카드는 지금처럼 경고 후 진행
+    make_post(tmp_path, date='2026-11-19')
+    assert pb.main(['--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert fake2.published and '경고: 중복 확인을 못 했습니다' in capsys.readouterr().out
+
+
+class PublishLost(FakeIG):
+    """media_publish 가 연결 오류/5xx 로 끝나고, appears_after 번째 최근 글 조회부터 글이 보인다(None 이면 끝내 안 보임)."""
+    def __init__(self, mode='5xx', appears_after=None, **kw):
+        super().__init__(**kw)
+        self.mode, self.appears_after, self.lookups = mode, appears_after, 0
+
+    def post(self, url, data=None, **kw):
+        if url.endswith('/media_publish'):
+            self.calls.append(('POST', url, dict(data or {})))
+            if self.mode == '4xx':
+                return Resp(400, {'error': {'message': 'Invalid creation_id', 'code': 100}})
+            if self.mode == 'conn':
+                raise requests.ConnectionError('reset')
+            if self.mode.startswith('t400'):
+                err = {'t400-transient': {'message': 'Temporary error', 'code': 100, 'is_transient': True},
+                       't400-code2': {'message': 'Service temporarily unavailable', 'code': 2},
+                       't400-sub': {'message': 'Instagram server error', 'code': 9007, 'error_subcode': 2207001}}[self.mode]
+                return Resp(400, {'error': err})
+            return Resp(503, {'error': {'message': 'Service unavailable', 'code': 2}})
+        return super().post(url, data, **kw)
+
+    def get(self, url, params=None, **kw):
+        if url.endswith('/media') and 'user' not in url and self.mode != '4xx':
+            self.lookups += 1
+            self.calls.append(('GET', url, dict(params or {})))
+            if self.appears_after is not None and self.lookups > self.appears_after:
+                now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+0000')
+                return Resp(200, {'data': [{'id': 'found1', 'caption': '릴스 첫 줄\n\n#태그', 'permalink': 'https://www.instagram.com/p/F/', 'timestamp': now}]})
+            return Resp(200, {'data': []})
+        return super().get(url, params, **kw)
+
+
+@pytest.mark.parametrize('mode', ['5xx', 'conn'])
+def test_reel_unknown_publish_result_found_on_recheck_counts_as_success(tmp_path, monkeypatch, renv, mode):
+    fake = install(monkeypatch, PublishLost(mode=mode, appears_after=3))     # 1번(게시 전 중복 확인)+2번 지나고 나타남
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    rec = json.loads((d / 'published.json').read_text(encoding='utf-8'))
+    assert rec['media_id'] == 'found1' and 'status' not in rec
+
+
+@pytest.mark.parametrize('mode', ['5xx', 'conn'])
+def test_reel_unknown_publish_result_never_found_writes_unknown_and_blocks_repost(tmp_path, monkeypatch, renv, capsys, mode):
+    fake = install(monkeypatch, PublishLost(mode=mode))
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 1
+    rec = json.loads((d / 'published.json').read_text(encoding='utf-8'))
+    assert rec['status'] == 'unknown' and rec['creation_id'] == 'c1' and rec['at'] and rec['note']
+    assert fake.lookups == 1 + pb.REEL_UNKNOWN_RECHECK[0]                   # 중복 확인 1 + 재확인 6
+    n = len(fake.calls)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0     # 다음 실행: 올리지 않음
+    assert len(fake.calls) == n and '게시 여부 확인 필요 — 다시 올리지 않음' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('mode', ['t400-transient', 't400-code2', 't400-sub'])
+def test_reel_transient_400_is_treated_as_unknown(tmp_path, monkeypatch, renv, capsys, mode):
+    fake = install(monkeypatch, PublishLost(mode=mode))
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 1
+    assert json.loads((d / 'published.json').read_text(encoding='utf-8'))['status'] == 'unknown'
+    assert fake.lookups == 1 + pb.REEL_UNKNOWN_RECHECK[0]
+    n = len(fake.calls)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert len(fake.calls) == n
+
+
+def test_reel_transient_400_found_on_recheck_is_success(tmp_path, monkeypatch, renv):
+    install(monkeypatch, PublishLost(mode='t400-code2', appears_after=3))
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 0
+    assert json.loads((d / 'published.json').read_text(encoding='utf-8'))['media_id'] == 'found1'
+
+
+def test_reel_clear_4xx_rejection_writes_no_record(tmp_path, monkeypatch, renv):
+    fake = install(monkeypatch, PublishLost(mode='4xx'))
+    d = make_reel(tmp_path)
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19'], root=tmp_path, env=renv) == 1
+    assert not (d / 'published.json').exists()
+
+
+def test_card_5xx_publish_failure_behaviour_unchanged(tmp_path, monkeypatch, env):
+    fake = install(monkeypatch, PublishLost(mode='5xx'))
+    d = make_post(tmp_path)
+    assert pb.main(['--date', '2026-10-07'], root=tmp_path, env=env) == 1
+    assert not (d / 'published.json').exists()                 # 카드는 unknown 기록을 남기지 않는다
+
+
+def test_reels_root_rejects_non_reel_post(tmp_path, monkeypatch, renv, capsys):
+    install(monkeypatch, FakeIG())
+    d = make_reel(tmp_path)
+    j = json.loads((d / 'post.json').read_text(encoding='utf-8'))
+    j['type'] = 'carousel'; j['images'] = ['cover.jpg']
+    (d / 'post.json').write_text(json.dumps(j), encoding='utf-8')
+    assert pb.main(['--root', 'reels', '--date', '2026-11-19', '--dry', '--no-url-check'], root=tmp_path, env=renv) == 1
+
+
+def test_card_path_unchanged_when_root_omitted(tmp_path, monkeypatch, renv):
+    fake = install(monkeypatch, FakeIG())
+    make_post(tmp_path, ptype='reel', date='2026-10-09')      # 카드 경로의 옛 릴스도 raw 주소 그대로
+    assert pb.main(['--date', '2026-10-09'], root=tmp_path, env=renv) == 0
+    assert fake.posts('/media')[0][2]['video_url'] == f'{RAW}/2026-10-09/video.mp4'
+    assert pb.build_parser().parse_args([]).root == 'posts'
