@@ -1,18 +1,21 @@
 # 매일 저녁 릴스(reels/<날짜>/)를 인스타에 올린다. 카드뉴스(publish.yml, 08:00)와는 별개 경로.
-# cron 은 UTC 기준: 09:13 UTC = 같은 날 18:13 KST (정각을 피해 혼잡을 줄임).
-# 이 저장소의 깃허브 예약 실행은 실제로 1시간 반~4시간 넘게 늦게 돈다(nboim-bot 커밋 시각 실측, 토큰 갱신은 최대 7시간).
-# 그래서 실제 게시는 대체로 18시~22시대이고, 아주 늦어도 날짜는 그날 몫이다
-# — 예약 실행은 대상 날짜를 (한국 시간 지금 − 12시간)의 날짜로 잡는다(publish.py resolve_date).
+# 이 저장소의 깃허브 예약 실행은 5~9시간씩 늦게 돈다(11-18·19 실측: 18:13 KST 예약이 다음 날 03:00 KST 에 돎).
+# 그래서 하루 한 번 예약은 새벽에 올라간다 — 대표 11-18 「매일 저녁 1편」과 다르다(11-20 고침).
+# 이제 매시간 깨우고(정각을 피해 :13), gate 가 한국 시간 18~24시(publish.py REEL_WINDOW 와 같게)에 닿은 실행만 통과시킨다.
+# 그날 몫을 이미 올렸거나 그날 폴더가 없으면 gate 에서 끝난다. publish.py 도 같은 시간대 검사·이중 게시 방지를 한 번 더 한다.
+# 수동 실행(Run workflow)은 시간대와 상관없이 진행(기본 dry). 실패한 예약 실행의 Re-run 은 예약 실행 그대로라 18~24시 규칙을 따른다
+# — 빠진 날은 자동으로 다시 올리지 않으니 Run workflow 에 날짜를 넣고 dry 를 끈다.
+# 실패(rc 1)하면 published.json 이 안 생겨 그날 24시 전까지 다음 매시간 실행이 다시 시도한다(원인이 그대로면 실패 메일도 시도마다).
 # 영상·표지 주소는 Cloudflare Pages 프로젝트 nboim-reels(tools/deploy_pages.sh 로 배포) — raw.githubusercontent 는 mp4 를 octet-stream 으로 준다.
 name: reels
 
 on:
   schedule:
-    - cron: '13 9 * * *'
+    - cron: '13 * * * *'
   workflow_dispatch:
     inputs:
       date:
-        description: '게시할 날짜 YYYY-MM-DD (비우면 오늘, 한국 시간. 예약 실행만 지금−12시간의 날짜)'
+        description: '게시할 날짜 YYYY-MM-DD (비우면 오늘, 한국 시간. 수동 실행은 저녁 18~24시 제한 없이 바로 진행)'
         required: false
         default: ''
       dry:
@@ -23,15 +26,52 @@ on:
 permissions:
   contents: write      # reels/<날짜>/published.json·token.enc 를 저장소에 커밋하기 위해
 
-# publish·refresh-token 과 같은 줄 — 상태 커밋이 겹치지 않게
-concurrency:
-  group: nboim-instagram-state
-  cancel-in-progress: false
-
 jobs:
+  # 가벼운 관문 — checkout 없이 시각과 그날 기록만 본다. 상태 줄(concurrency)에 들어가지 않으므로
+  # 매시간 실행이 카드(publish)·토큰 갱신의 대기 실행을 밀어내지 않는다.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read     # 읽기만 한다(게시·커밋은 reels 작업)
+    outputs:
+      go: ${{ steps.g.outputs.go }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ]; then
+            echo "수동 실행 — 시간대 확인 없이 진행"; echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # 한 번에 읽어 자정 직전에 시각·날짜가 엇갈리지 않게. KST-9 = POSIX 표기(tzdata 없이도 +9, 한국은 서머타임 없음)
+          read -r h d <<< "$(TZ=KST-9 date '+%-H %F')"
+          if [ "$h" -lt 18 ]; then
+            echo "한국 시간 ${h}시 — 저녁 시간대(18~24시)가 아니라 건너뜀"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # 200 = 있음, 404 = 없음. 그 밖(네트워크·5xx)은 모른다 → 통과시키고 publish.py 가 최신 main 으로 다시 판정한다.
+          code() {
+            curl -s --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/reels/${d}/$1?ref=${GITHUB_REF_NAME}" || true
+          }
+          if [ "$(code published.json)" = "200" ]; then
+            echo "${d} 게시 기록(published.json) 있음 — 건너뜀 (status=unknown 도 여기서 멈춤)"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$(code post.json)" = "404" ]; then
+            echo "${d} 올릴 릴스 없음 — 건너뜀"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "${d} ${h}시 — 게시 단계로"; echo "go=true" >> "$GITHUB_OUTPUT"
+
   reels:
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # publish·refresh-token 과 같은 줄 — 상태 커밋이 겹치지 않게(실제로 올릴 수 있는 실행만 여기 들어온다)
+    concurrency:
+      group: nboim-instagram-state
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:

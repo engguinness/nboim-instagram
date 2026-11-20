@@ -4,7 +4,10 @@ import base64
 import datetime
 import hashlib
 import json
+import os
+import re
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -626,14 +629,64 @@ def test_reel_date_rule_schedule_minus_12h_otherwise_today(monkeypatch):
     assert pb.resolve_date(ns(), sched, False)[0] == '2026-11-20'                       # 카드 경로는 불변
 
 
-def test_reel_scheduled_run_picks_previous_day_when_late_and_logs_rule(tmp_path, monkeypatch, renv, capsys):
+def test_reel_scheduled_run_outside_evening_window_does_nothing(tmp_path, monkeypatch, renv, capsys):
+    # 11-19 몫이 깃허브 지연으로 11-20 03:13 에 올라갔다 — 이제 저녁(18~24시)이 아니면 예약 실행은 아무것도 안 한다.
     KST = datetime.timezone(datetime.timedelta(hours=9))
-    monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(2026, 11, 20, 2, 30, tzinfo=KST))
     fake = install(monkeypatch, FakeIG())
     d = make_reel(tmp_path, '2026-11-19')
+    make_reel(tmp_path, '2026-11-20')
+    for hm in [(2, 30), (11, 59), (17, 59)]:
+        monkeypatch.setattr(pb, 'kst_now', lambda hm=hm: datetime.datetime(2026, 11, 20, *hm, tzinfo=KST))
+        assert pb.main(['--root', 'reels'], root=tmp_path, env=dict(renv, GITHUB_EVENT_NAME='schedule')) == 0
+        out = capsys.readouterr().out
+        assert '저녁 시간대(18~24시)가 아니라' in out and '대상 날짜' not in out
+    assert fake.calls == []
+    assert not (d / 'published.json').exists() and not (tmp_path / 'reels' / '2026-11-20' / 'published.json').exists()
+
+
+def test_reel_scheduled_run_in_evening_posts_today_and_logs_rule(tmp_path, monkeypatch, renv, capsys):
+    KST = datetime.timezone(datetime.timedelta(hours=9))
+    monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(2026, 11, 20, 19, 5, tzinfo=KST))
+    fake = install(monkeypatch, FakeIG())
+    make_reel(tmp_path, '2026-11-19')                         # 어제 몫이 남아 있어도 오늘 몫만
+    d = make_reel(tmp_path, '2026-11-20')
     assert pb.main(['--root', 'reels'], root=tmp_path, env=dict(renv, GITHUB_EVENT_NAME='schedule')) == 0
     out = capsys.readouterr().out
-    assert '대상 날짜 : 2026-11-19' in out and '예약 실행' in out and (d / 'published.json').exists()
+    assert '대상 날짜 : 2026-11-20' in out and '예약 실행' in out and (d / 'published.json').exists()
+    assert not (tmp_path / 'reels' / '2026-11-19' / 'published.json').exists()
+    # 같은 저녁에 다시 깨어도(매시간 예약) 두 번 올리지 않는다
+    n = len(fake.calls)
+    monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(2026, 11, 20, 20, 5, tzinfo=KST))
+    assert pb.main(['--root', 'reels'], root=tmp_path, env=dict(renv, GITHUB_EVENT_NAME='schedule')) == 0
+    assert '이미 게시됨' in capsys.readouterr().out and len(fake.calls) == n
+
+
+def test_reel_window_boundaries_and_manual_runs_ignore_window(monkeypatch):
+    KST = datetime.timezone(datetime.timedelta(hours=9))
+    def at(*a):
+        monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(*a, tzinfo=KST))
+    ns = lambda date=None: type('A', (), {'date': date})()
+    sched = {'GITHUB_EVENT_NAME': 'schedule'}
+    assert pb.REEL_WINDOW == (18, 24)
+    at(2026, 11, 20, 17, 59); assert pb.reel_window_skip(ns(), sched)
+    at(2026, 11, 20, 18, 0);  assert pb.reel_window_skip(ns(), sched) is None
+    at(2026, 11, 20, 23, 59); assert pb.reel_window_skip(ns(), sched) is None
+    at(2026, 11, 21, 0, 0);   assert pb.reel_window_skip(ns(), sched)
+    at(2026, 11, 21, 3, 0)
+    assert pb.reel_window_skip(ns(), {'GITHUB_EVENT_NAME': 'workflow_dispatch'}) is None    # 수동 실행은 시간대 무관
+    assert pb.reel_window_skip(ns(), {}) is None                                             # 로컬 실행도
+    assert pb.reel_window_skip(ns('2026-11-21'), sched) is None                              # --date 지정도
+
+
+def test_reels_workflow_wakes_hourly_and_gate_matches_window():
+    wf = (Path(pb.__file__).resolve().parent / '.github' / 'workflows' / 'reels.yml').read_text(encoding='utf-8')
+    assert "cron: '13 * * * *'" in wf                         # 매시간 깨움(하루 한 번 예약은 5~9시간 늦게 돌았다)
+    assert f'-lt {pb.REEL_WINDOW[0]} ]' in wf and "TZ=KST-9 date '+%-H %F'" in wf    # gate 의 시작 시각 = REEL_WINDOW 시작
+    assert 'needs: gate' in wf and "needs.gate.outputs.go == 'true'" in wf
+    assert '--max-time' in wf                                 # 깃허브 API 가 멈춰도 gate 가 5분 제한에 걸려 실패하지 않게
+    # 상태 줄(concurrency)은 실제로 올릴 수 있는 실행만 들어간다 — 매시간 실행이 카드·토큰 갱신 대기 실행을 밀어내지 않게
+    head, _, jobs = wf.partition('\njobs:')
+    assert not re.search(r'^concurrency:', head, re.M) and 'group: nboim-instagram-state' in jobs.split('\n  reels:', 1)[1]
 
 
 def test_root_reels_reads_reels_dir_not_posts(tmp_path, monkeypatch, renv, capsys):
@@ -853,3 +906,107 @@ def test_card_path_unchanged_when_root_omitted(tmp_path, monkeypatch, renv):
     assert pb.main(['--date', '2026-10-09'], root=tmp_path, env=renv) == 0
     assert fake.posts('/media')[0][2]['video_url'] == f'{RAW}/2026-10-09/video.mp4'
     assert pb.build_parser().parse_args([]).root == 'posts'
+
+
+# ---------------------------------------------------------------- reels.yml gate 스크립트(11-20 검토 반영)
+# gate 를 실제 bash 로 돌린다 — date·curl 은 가짜. 한국 시각은 TZ 가 KST-9(또는 Asia/Seoul)일 때만, 아니면 UTC 로 답한다.
+
+WF_REELS = Path(pb.__file__).resolve().parent / '.github' / 'workflows' / 'reels.yml'
+KST_TZ = datetime.timezone(datetime.timedelta(hours=9))
+
+_FAKE_DATE = '''#!/bin/bash
+d="${FAKE_KST% *}"; h=$((10#${FAKE_KST#* }))
+case "$TZ" in KST-9|Asia/Seoul) ;; *) h=$(( (h + 15) % 24 ));; esac      # TZ 없이 부르면 UTC 시각
+for a; do case "$a" in '+%-H %F') echo "$h $d";; +%-H) echo "$h";; +%F) echo "$d";; esac; done
+'''
+_FAKE_CURL = '''#!/bin/bash
+u="${@: -1}"; echo "$u" >> "$CURL_LOG"
+case "$u" in */published.json\\?*) c=$FAKE_PUB;; */post.json\\?*) c=$FAKE_POST;; *) c=999;; esac
+printf '%s' "$c"; [ "$c" != 000 ]
+'''
+
+
+def _gate_block():
+    return WF_REELS.read_text(encoding='utf-8').split('\n  gate:', 1)[1].split('\n  reels:', 1)[0]
+
+
+@pytest.mark.parametrize('event,kst,pub,post,go', [
+    ('workflow_dispatch', '2026-11-21 03', '', '', 'true'),   # 수동 실행: 시각·기록을 안 봄
+    ('schedule', '2026-11-21 00', '404', '200', 'false'),     # 자정 넘김(11-19 몫이 11-20 03:13 에 올라간 시각대)
+    ('schedule', '2026-11-20 03', '404', '200', 'false'),
+    ('schedule', '2026-11-20 17', '404', '200', 'false'),
+    ('schedule', '2026-11-20 18', '404', '200', 'true'),
+    ('schedule', '2026-11-20 23', '404', '200', 'true'),
+    ('schedule', '2026-11-20 19', '200', '200', 'false'),     # 게시 기록 있음(status=unknown 포함)
+    ('schedule', '2026-11-20 19', '404', '404', 'false'),     # 그날 몫 없음
+    ('schedule', '2026-11-20 19', '000', '000', 'true'),      # API 모름(타임아웃 포함) → publish.py 가 판정
+])
+def test_reels_gate_script(tmp_path, event, kst, pub, post, go):
+    bin_ = tmp_path / 'bin'
+    bin_.mkdir()
+    for name, src in (('date', _FAKE_DATE), ('curl', _FAKE_CURL)):
+        (bin_ / name).write_text(src)
+        (bin_ / name).chmod(0o755)
+    script = textwrap.dedent(_gate_block().split('run: |\n', 1)[1])
+    out, log = tmp_path / 'out', tmp_path / 'curl.log'
+    out.write_text('')
+    log.write_text('')
+    env = {k: v for k, v in os.environ.items() if k != 'TZ'}
+    env.update(PATH=f'{bin_}{os.pathsep}{env["PATH"]}', GITHUB_EVENT_NAME=event, GITHUB_OUTPUT=str(out),
+               GITHUB_REPOSITORY='o/r', GITHUB_REF_NAME='main', GH_TOKEN='t', FAKE_KST=kst,
+               FAKE_PUB=pub, FAKE_POST=post, CURL_LOG=str(log))
+    r = subprocess.run(['bash', '-e', '-c', script], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr                         # gate 가 실패하면 매시간 실패 메일
+    assert re.findall(r'^go=(\w+)$', out.read_text(), re.M) == [go]
+    if event != 'schedule' or int(kst[-2:]) < pb.REEL_WINDOW[0]:
+        assert log.read_text() == ''                           # 시간대 밖·수동은 API 호출 없음
+    else:
+        assert f'/contents/reels/{kst[:10]}/published.json?ref=main' in log.read_text()
+
+
+def test_reels_gate_wiring_and_no_concurrency_on_gate():
+    wf = WF_REELS.read_text(encoding='utf-8')
+    gate = _gate_block()
+    assert '      go: ${{ steps.g.outputs.go }}' in gate and '      - id: g\n' in gate
+    assert '''read -r h d <<< "$(TZ=KST-9 date '+%-H %F')"''' in gate and f'[ "$h" -lt {pb.REEL_WINDOW[0]} ]' in gate
+    assert pb.REEL_WINDOW[1] == 24                             # gate 에는 끝 시각 검사가 없다(하루 끝까지)
+    assert 'contents: read' in gate                            # gate 는 읽기 권한만
+    assert not re.search(r'^\s*concurrency:', gate, re.M)      # 주석의 「(concurrency)」는 제외
+    assert not re.search(r'^concurrency:', wf.split('\njobs:', 1)[0], re.M)
+
+
+def test_card_schedule_run_is_not_limited_by_reel_window(tmp_path, monkeypatch, env):
+    monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(2026, 11, 20, 12, 56, tzinfo=KST_TZ))   # 11-19 실측 카드 시각
+    fake = install(monkeypatch, FakeIG())
+    d = make_post(tmp_path, date='2026-11-20')
+    assert pb.main([], root=tmp_path, env=dict(env, GITHUB_EVENT_NAME='schedule')) == 0
+    assert fake.published and (d / 'published.json').exists()
+
+
+class _NoNet:
+    def __getattr__(self, name):
+        raise AssertionError(f'네트워크 호출: requests.{name}')
+
+
+def test_reel_schedule_outside_window_touches_nothing_all_hours(tmp_path, monkeypatch, capsys):
+    make_reel(tmp_path, '2026-11-20')
+    make_reel(tmp_path, '2026-11-21')
+    before = sorted(str(p) for p in tmp_path.rglob('*'))
+    monkeypatch.setattr(pb, 'requests', _NoNet())
+    for day, h in [(21, 0), (21, 3), (21, 12), (21, 17)]:
+        monkeypatch.setattr(pb, 'kst_now', lambda day=day, h=h: datetime.datetime(2026, 11, day, h, 13, tzinfo=KST_TZ))
+        assert pb.main(['--root', 'reels'], root=tmp_path, env={'GITHUB_EVENT_NAME': 'schedule'}) == 0   # 시크릿 없이도 0
+        assert '저녁 시간대' in capsys.readouterr().out
+    assert sorted(str(p) for p in tmp_path.rglob('*')) == before          # 어제 몫(11-20)도 안 건드림
+
+
+def test_reel_manual_run_at_3am_posts_today_and_date_recovers_missed_day(tmp_path, monkeypatch, env):
+    monkeypatch.setattr(pb, 'kst_now', lambda: datetime.datetime(2026, 11, 21, 3, 0, tzinfo=KST_TZ))
+    y, t = make_reel(tmp_path, '2026-11-20'), make_reel(tmp_path, '2026-11-21')
+    manual = dict(env, GITHUB_EVENT_NAME='workflow_dispatch')
+    install(monkeypatch, FakeIG())
+    assert pb.main(['--root', 'reels'], root=tmp_path, env=manual) == 0
+    assert (t / 'published.json').exists() and not (y / 'published.json').exists()
+    install(monkeypatch, FakeIG())
+    assert pb.main(['--root', 'reels', '--date', '2026-11-20'], root=tmp_path, env=manual) == 0
+    assert (y / 'published.json').exists()

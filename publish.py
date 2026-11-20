@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""앤보임 인스타(@justenglish_guinness) 자동 게시기 — GitHub Actions 에서 매일 아침 08:00(KST)에 돈다.
+"""앤보임 인스타(@justenglish_guinness) 자동 게시기 — GitHub Actions 에서 돈다: 카드는 매일 08:00(KST) 예약(publish.yml),
+릴스(--root reels)는 매시간 깨워 한국 시간 저녁 18~24시 실행만 올린다(reels.yml).
 
 동작: 오늘(Asia/Seoul) 날짜의 posts/<날짜>/post.json 을 읽어 캐러셀(또는 사진 1장)·릴스를 올린다.
   - Instagram API with Instagram Login (graph.instagram.com) — 컨테이너 만들기 → (릴스는 처리 대기) → media_publish
@@ -18,19 +19,24 @@
     python publish.py --date 2026-10-07     # 날짜 지정
     python publish.py --dry                 # API 호출 없이 무엇을 올릴지만 출력(미디어 URL 확인은 함)
     python publish.py --refresh-token       # 토큰 갱신 → state/token.enc
-    python publish.py --root reels          # 릴스 경로: reels/<날짜>/ 를 읽는다(reels.yml 이 매일 저녁 18:13 KST 예약으로 호출)
+    python publish.py --root reels          # 릴스 경로: reels/<날짜>/ 를 읽는다(reels.yml 이 매시간 깨우고 gate 를 통과한 저녁 18~24시 실행만 호출)
 
 릴스 경로(--root reels): 영상·표지 주소는 raw.githubusercontent 가 mp4 를 octet-stream 으로 주기 때문에
   Cloudflare Pages 전용 프로젝트(nboim-reels)의 <REEL_MEDIA_BASE>/reels/<날짜>/video.mp4 꼴로 만든다
   (REEL_MEDIA_BASE 기본 https://nboim-reels.pages.dev, 배포는 tools/deploy_pages.sh).
   컨테이너를 만들기 전에 200·video/mp4(표지는 image/jpeg)를 확인하고, 안 되면 몇 번 기다려 다시 본다. 끝내 안 되면 게시하지 않고 실패.
-  날짜: 예약 실행(GITHUB_EVENT_NAME=schedule)이고 --date 가 없으면 (한국 시간 지금 − 12시간)의 날짜 — 깃허브 예약이 몇 시간 늦게 돌아도 그날 몫을 올린다.
+  시간대: 예약 실행(GITHUB_EVENT_NAME=schedule)이고 --date 가 없으면 한국 시간 REEL_WINDOW(18~24시) 안에서만 올리고,
+    밖이면 아무것도 하지 않고 0 으로 끝난다 — 대표 11-18 「매일 저녁 1편」. 깃허브 예약이 5~9시간씩 늦게 돌아
+    하루 한 번 예약은 새벽 3시에 올라갔다(11-19 몫). 그래서 reels.yml 은 매시간 깨우고 저녁에 닿은 실행만 올린다.
+  날짜: 예약 실행은 (한국 시간 지금 − 12시간)의 날짜 — 저녁 시간대 안에서는 늘 오늘이다. 수동 실행·로컬 실행·--date 는 시간대와 상관없이 진행.
+    빠진 날은 자동으로 다시 올리지 않는다(다음 날 저녁은 그날 몫만) — 복구는 Run workflow 에 날짜를 넣고 dry 를 끈다.
   이중 게시 방지(reels/<날짜>/published.json·최근 캡션 대조)는 카드와 같고, 카드(posts/)와는 서로 막지 않는다.
   릴스는 더 엄격하다: 최근 게시물 조회가 실패하면 게시하지 않고 실패(하루 빠지는 편이 두 번 올라가는 것보다 낫다),
   발행 결과를 알 수 없으면(연결 오류·타임아웃·5xx) 10초 간격 6번 최근 글을 다시 보고, 끝내 못 찾으면 published.json 에
   status=unknown 을 남겨 자동 재게시를 막는다(사람이 확인).
 
-종료 코드: 0 = 게시함·게시물 없음·이미 게시됨·드라이런 / 1 = 실패(Actions 가 실패 메일을 보낸다)
+종료 코드: 0 = 게시함·게시물 없음·이미 게시됨·확인 필요(status=unknown)·드라이런·릴스 예약 실행의 저녁 시간대 밖
+  / 1 = 실패(Actions 가 실패 메일을 보낸다 — 릴스는 그날 24시 전까지 매시간 다시 시도하므로 원인이 그대로면 메일도 시도마다)
 """
 from __future__ import annotations
 
@@ -66,6 +72,7 @@ REEL_MEDIA_BASE_DEFAULT = 'https://nboim-reels.pages.dev'   # 릴스 영상·표
 REEL_URL_WAIT = (8, 20)      # 릴스 미디어 주소 확인(실제 게시): (최대 횟수, 간격 초) — 배포 직후 엣지 반영이 늦을 수 있다
 REEL_URL_WAIT_DRY = (3, 10)  # 릴스 드라이런의 주소 확인: 짧게
 REEL_LATE_HOURS = 12         # 예약 실행의 대상 날짜 = (한국 시간 지금 − 이 시간)의 날짜
+REEL_WINDOW = (18, 24)       # 릴스 예약 실행이 실제로 올리는 한국 시간 [시작 시, 끝 시) — reels.yml 의 gate 와 같게
 REEL_UNKNOWN_RECHECK = (6, 10)   # 발행 결과를 모를 때 최근 글 재확인: (횟수, 간격 초)
 REEL_POLL = (60, 5)          # 릴스 컨테이너: 5초 간격 최대 60번 = 5분
 DEDUPE_HOURS = 48            # 같은 캡션이 이 시간 안에 이미 올라가 있으면 다시 안 올린다
@@ -396,8 +403,21 @@ def resolve_date(args, env, is_reels_root):
     now = kst_now()
     if is_reels_root and (env.get('GITHUB_EVENT_NAME') or '') == 'schedule':
         d = (now - datetime.timedelta(hours=REEL_LATE_HOURS)).date().isoformat()
-        return d, f'예약 실행 — 한국 시간 지금({now.strftime("%Y-%m-%d %H:%M")}) − {REEL_LATE_HOURS}시간의 날짜(늦게 돌아도 그날 몫)'
+        return d, f'예약 실행 — 한국 시간 지금({now.strftime("%Y-%m-%d %H:%M")}) − {REEL_LATE_HOURS}시간의 날짜(저녁 시간대 안에서는 오늘)'
     return now.date().isoformat(), '오늘(한국 시간)'
+
+
+def reel_window_skip(args, env):
+    """릴스 예약 실행(--date 없음)은 저녁 시간대(REEL_WINDOW)에만 올린다. 밖이면 건너뛰는 이유 한 줄, 안이면 None.
+    수동 실행(workflow_dispatch)·--date 는 사람이 고른 것이라 시간대를 보지 않는다."""
+    if args.date or (env.get('GITHUB_EVENT_NAME') or '') != 'schedule':
+        return None
+    now = kst_now()
+    start, end = REEL_WINDOW
+    if start <= now.hour < end:
+        return None
+    return (f'예약 실행 — 한국 시간 {now.strftime("%Y-%m-%d %H:%M")} 은 저녁 시간대({start}~{end}시)가 아니라 '
+            f'아무것도 하지 않습니다.')
 
 
 def check_media_urls(urls, kinds, strict=False):
@@ -645,6 +665,10 @@ def run(args, root=None, env=None):
         raise PublishError(f'--root 는 {" 또는 ".join(CONTENT_DIRS)} 중 하나여야 합니다: {section!r}')
     is_reels_root = section == 'reels'
     if is_reels_root:
+        skip = reel_window_skip(args, env)
+        if skip:
+            log(skip)
+            return 0
         date, why = resolve_date(args, env, True)
         log(f'대상 날짜 : {date} — {why}')
     else:
@@ -712,7 +736,7 @@ def run(args, root=None, env=None):
         dup = find_recent_same_caption(token, user_id, caption)
     except PublishError as e:
         if is_reels_root:
-            # 릴스: 이중 게시가 더 나쁘다 — 중복 여부를 모르면 올리지 않는다(내일 다시 돈다고 해도 그날 몫은 빠진다)
+            # 릴스: 이중 게시가 더 나쁘다 — 중복 여부를 모르면 올리지 않는다(published.json 이 없으니 그날 24시 전까지는 다음 매시간 실행이 다시 시도한다)
             raise PublishError(f'중복 확인을 못 해 게시하지 않습니다({e})')
         log(f'경고: 중복 확인을 못 했습니다({e}) — 계속 진행합니다.')
         dup = None
